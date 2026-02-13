@@ -1,0 +1,177 @@
+name: merge status (main → prod)
+
+on:
+  # Run when PRs are merged into main
+  pull_request:
+    types: [closed]
+    branches: [main]
+  
+  # Run when prod is updated
+  push:
+    branches: [prod]
+  
+  # Scheduled run every 15 minutes
+  schedule:
+    - cron: '*/1 * * * *'
+  
+  # Manual trigger
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  MERGE_STATUS_ISSUE_TITLE: "Open PRs for prod"
+
+jobs:
+  update-merge-status:
+    runs-on: ubuntu-latest
+    # Only run if PR was merged (not just closed) or if it's a push/schedule/manual trigger
+    if: >
+      github.event_name != 'pull_request' || 
+      (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history needed for ancestry checks
+          ref: main
+
+      - name: Fetch prod branch
+        run: |
+          git fetch origin prod:prod || echo "prod branch may not exist yet"
+
+      - name: Find existing issue
+        id: find-issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const title = process.env.MERGE_STATUS_ISSUE_TITLE;
+            
+            // Search for existing issue by title
+            const issues = await github.rest.issues.listForRepo({
+              owner, repo,
+              state: 'open',
+              per_page: 100
+            });
+            
+            const existingIssue = issues.data.find(i => i.title === title);
+            
+            if (existingIssue) {
+              console.log(`Found existing issue: #${existingIssue.number} - "${title}"`);
+              core.setOutput('issue_number', existingIssue.number);
+            } else {
+              core.setFailed(`Issue "${title}" not found. Please create it manually first.`);
+            }
+
+      - name: Get pending promotions
+        id: get-pending
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Fetching merged PRs from main branch..."
+          
+          # Get PRs merged into main in the last 30 days
+          MERGED_PRS=$(gh pr list \
+            --base main \
+            --state merged \
+            --json number,title,author,mergedAt,mergeCommitSha \
+            --limit 100 \
+            --jq '.[] | select(.mergeCommitSha != null)')
+          
+          echo "Found merged PRs, checking promotion status..."
+          
+          # Build the pending list
+          PENDING_JSON="[]"
+          
+          while IFS= read -r pr; do
+            [ -z "$pr" ] && continue
+            
+            PR_NUMBER=$(echo "$pr" | jq -r '.number')
+            PR_TITLE=$(echo "$pr" | jq -r '.title')
+            PR_AUTHOR=$(echo "$pr" | jq -r '.author.login')
+            MERGED_AT=$(echo "$pr" | jq -r '.mergedAt')
+            MERGE_SHA=$(echo "$pr" | jq -r '.mergeCommitSha')
+            
+            # Check if merge commit exists in prod
+            if git merge-base --is-ancestor "$MERGE_SHA" prod 2>/dev/null; then
+              echo "PR #$PR_NUMBER ($MERGE_SHA) - Already in prod ✅"
+            else
+              echo "PR #$PR_NUMBER ($MERGE_SHA) - Pending promotion ⏳"
+              
+              # Add to pending list
+              PENDING_JSON=$(echo "$PENDING_JSON" | jq \
+                --argjson num "$PR_NUMBER" \
+                --arg title "$PR_TITLE" \
+                --arg author "$PR_AUTHOR" \
+                --arg merged "$MERGED_AT" \
+                --arg sha "$MERGE_SHA" \
+                '. + [{number: $num, title: $title, author: $author, mergedAt: $merged, sha: $sha}]')
+            fi
+          done <<< "$MERGED_PRS"
+          
+          # Sort by merge date (oldest first)
+          PENDING_JSON=$(echo "$PENDING_JSON" | jq 'sort_by(.mergedAt)')
+          
+          # Save to file for next step
+          echo "$PENDING_JSON" > pending_prs.json
+          
+          # Count pending
+          PENDING_COUNT=$(echo "$PENDING_JSON" | jq 'length')
+          echo "pending_count=$PENDING_COUNT" >> $GITHUB_OUTPUT
+
+      - name: Update merge status issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const issueNumber = ${{ steps.find-issue.outputs.issue_number }};
+            const pendingCount = ${{ steps.get-pending.outputs.pending_count }};
+            
+            // Read pending PRs
+            const pendingPRs = JSON.parse(fs.readFileSync('pending_prs.json', 'utf8'));
+            
+            // Build issue body
+            let body = `<!-- merge-status -->\n`;
+            body += `## 🚀 PRs Pending Promotion to \`prod\`\n\n`;
+            body += `**${pendingCount}** PR(s) merged into \`main\` awaiting promotion.\n\n`;
+            
+            if (pendingPRs.length === 0) {
+              body += `✅ **All PRs have been promoted to \`prod\`!**\n\n`;
+            } else {
+              body += `| PR | Title | Author | Merged to Main | Commit |\n`;
+              body += `|----|-------|--------|----------------|--------|\n`;
+              
+              for (const pr of pendingPRs) {
+                const mergedDate = new Date(pr.mergedAt).toLocaleDateString('en-GB', {
+                  day: '2-digit',
+                  month: '2-digit', 
+                  year: 'numeric'
+                });
+                const shortSha = pr.sha.substring(0, 7);
+                const prLink = `[#${pr.number}](https://github.com/${owner}/${repo}/pull/${pr.number})`;
+                const commitLink = `[\`${shortSha}\`](https://github.com/${owner}/${repo}/commit/${pr.sha})`;
+                
+                // Truncate title if too long
+                const title = pr.title.length > 50 ? pr.title.substring(0, 47) + '...' : pr.title;
+                
+                body += `| ${prLink} | ${title} | @${pr.author} | ${mergedDate} | ${commitLink} |\n`;
+              }
+            }
+            
+            body += `\n---\n`;
+            body += `<sub>🔄 Last updated: ${new Date().toISOString()} • `;
+            body += `[View workflow run](https://github.com/${owner}/${repo}/actions/runs/${context.runId})</sub>\n`;
+            
+            // Update the issue
+            await github.rest.issues.update({
+              owner, repo,
+              issue_number: issueNumber,
+              body: body
+            });
+            
+            console.log(`Updated merge status issue #${issueNumber} with ${pendingCount} pending PR(s)`);
